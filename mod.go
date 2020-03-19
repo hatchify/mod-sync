@@ -1,10 +1,19 @@
 package sync
 
 import (
+	"os"
+	"os/exec"
+	"path"
 	"strings"
 
 	sort "github.com/hatchify/mod-sort"
 )
+
+// CleanModCache calls go clean --modcache from calling directory. No context necessary
+func CleanModCache() error {
+	cmd := exec.Command("go", "clean", "--modcache")
+	return cmd.Run()
+}
 
 // ModInit calls go mod init on a given lib
 func (lib *Library) ModInit() error {
@@ -16,9 +25,8 @@ func (lib *Library) ModTidy() error {
 	return lib.File.RunCmd("go", "mod", "tidy")
 }
 
-// ModClear calls rm go.* to remove go mod files on a given lib
-// Returns true if go mod file was found
-func (lib *Library) ModClear() (hasModFile, hasSumFile bool) {
+// ModClearFiles calls rm go.mod and rm go.sum, returning the success of both commands
+func (lib *Library) ModClearFiles() (hasModFile, hasSumFile bool) {
 	if lib.File.RunCmd("rm", "go.mod") == nil {
 		hasModFile = true
 	}
@@ -33,8 +41,9 @@ func (lib *Library) ModClear() (hasModFile, hasSumFile bool) {
 // ModAddDeps adds a dep@version to go.mod to force-update or force-downgrade any deps in the filtered chain
 func (lib *Library) ModAddDeps(listHead *sort.FileNode) {
 	for itr := listHead; itr != nil && itr.File.Path != lib.File.Path; itr = itr.Next {
+		// Check if lib/go.mod includes the file (not go.sum)
 		if lib.File.ImportsDirectly(itr.File) {
-			// Create new node to add to independent list on lib
+			// Create new node to add to independent list on lib with same file ref
 			var node sort.FileNode
 			node.File = itr.File
 			lib.AddDep(&node)
@@ -44,6 +53,7 @@ func (lib *Library) ModAddDeps(listHead *sort.FileNode) {
 
 // ModSetDeps adds a dep@version to go.mod to force-update or force-downgrade any deps in the filtered chain
 func (lib *Library) ModSetDeps() {
+	// Iterate through dep chain
 	for itr := lib.updatedDeps; itr != nil; itr = itr.Next {
 		if len(itr.File.Version) == 0 {
 			lib.File.Output("Error: no version to set for " + itr.File.Path)
@@ -51,6 +61,7 @@ func (lib *Library) ModSetDeps() {
 		} else {
 			url := itr.File.GetGoURL()
 
+			// Get dep @ version (-d avoids building)
 			if lib.File.RunCmd("go", "get", "-d", url+"@"+itr.File.Version) == nil {
 				if itr.File.Updated || itr.File.Tagged || itr.File.Deployed {
 					lib.File.Output("Updated " + url + " @ " + itr.File.Version)
@@ -60,6 +71,44 @@ func (lib *Library) ModSetDeps() {
 			}
 		}
 	}
+
+	lib.AppendToModfile("// *** Separate Local Deps *** \\\\")
+}
+
+// SetLocalDep adds replace clause for provided file
+func (lib *Library) SetLocalDep(file sort.FileNode) (updated bool) {
+	return lib.AppendToModfile(file.File.GetGoURL())
+}
+
+// SetLocalDeps adds replace clause for all updated deps
+func (lib *Library) SetLocalDeps() (updated bool) {
+	localSuffix := ""
+	for fileItr := lib.updatedDeps; fileItr != nil; fileItr = fileItr.Next {
+		localSuffix += "replace " + fileItr.File.GetGoURL() + " => ../../../" + fileItr.File.GetGoURL() + "\n"
+	}
+
+	return lib.AppendToModfile(localSuffix)
+}
+
+// AppendToModfile appends provided string to end of mod file
+func (lib *Library) AppendToModfile(text string) bool {
+	// Open absolute path to mod file in append mode
+	f, err := os.OpenFile(path.Join(lib.File.AbsPath(), "go.mod"),
+		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		lib.File.Output("Unable to open mod file: " + path.Join(lib.File.AbsPath(), "go.mod"))
+		return false
+	}
+	defer f.Close()
+
+	// Append message
+	if _, err := f.WriteString(text + "\n"); err != nil {
+		lib.File.Output("Unable to write to mod file")
+		return false
+	}
+
+	// Write successful
+	return true
 }
 
 // ModDeploy will commit and push local changes to the current branch before switching to master
@@ -139,12 +188,23 @@ func (lib *Library) ModUpdate(branch, commitMessage string) (err error) {
 
 	lib.File.Output("Checking deps...")
 
-	if err = lib.ModTidy(); err != nil {
+	// Remove go.mod, ignore lib if not found (not a mod tracked lib)
+	if lib.File.RunCmd("rm", "go.mod") != nil {
 		lib.File.Output("No mod file found. Skipping.")
 		return
 	}
 
-	lib.File.RunCmd("rm", "go.sum")
+	// Remove go sum to prevent mess from adding up
+	if lib.File.RunCmd("rm", "go.sum") == nil {
+		// No dependencies found. If this is unexpected for a given lib, something is out of sync
+		lib.File.Output("No sum file found. No dependencies sorted.")
+	}
+
+	if err = lib.ModInit(); err != nil {
+		lib.File.Output("Mod init failed :(")
+		return
+	}
+
 	lib.ModSetDeps()
 
 	if err = lib.ModTidy(); err != nil {
